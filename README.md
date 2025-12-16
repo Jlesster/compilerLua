@@ -1,3 +1,4 @@
+##    This is a modified compiler.nvim for java and c++ development (adding mvn build support, auto linker and main autodetection)
 # [Compiler.nvim](https://github.com/Zeioth/compiler.nvim)
 Neovim compiler for building and running your code without having to configure anything.
 
