@@ -1,978 +1,374 @@
 --- C++ language actions with enhanced autodetection
-
 local M = {}
-
--- Cache for pkg-config checks to avoid repeated system calls
 local pkg_cache = {}
 
--- Helper: detect and get flags for a library using pkg-config (cached)
-local function get_pkg_config_flags(lib_name)
-  if pkg_cache[lib_name] ~= nil then
-    return pkg_cache[lib_name]
-  end
-
-  local handle = io.popen("pkg-config --cflags --libs " .. lib_name .. " 2>/dev/null")
-  if not handle then
-    pkg_cache[lib_name] = false
-    return nil
-  end
-  local flags = handle:read("*a")
+local function get_pkg_config_flags(lib)
+  if pkg_cache[lib] ~= nil then return pkg_cache[lib] end
+  local handle = io.popen("pkg-config --cflags --libs " .. lib .. " 2>/dev/null")
+  if not handle then pkg_cache[lib] = false return nil end
+  local flags = handle:read("*a"):gsub("\n", "")
   handle:close()
-
-  if flags and flags ~= "" then
-    flags = flags:gsub("\n", "")
-    pkg_cache[lib_name] = flags
-    return flags
-  end
-  pkg_cache[lib_name] = false
-  return nil
+  pkg_cache[lib] = flags ~= "" and flags or false
+  return pkg_cache[lib]
 end
 
--- Helper: check if a library exists via pkg-config (cached)
-local function check_pkg_config(lib_name)
-  if pkg_cache[lib_name] ~= nil then
-    return pkg_cache[lib_name] ~= false
-  end
-
-  local handle = io.popen("pkg-config --exists " .. lib_name .. " 2>/dev/null && echo 'yes'")
-  if not handle then
-    pkg_cache[lib_name] = false
-    return false
-  end
-  local result = handle:read("*a")
+local function check_pkg_config(lib)
+  if pkg_cache[lib] ~= nil then return pkg_cache[lib] ~= false end
+  local handle = io.popen("pkg-config --exists " .. lib .. " 2>/dev/null && echo 'yes'")
+  if not handle then pkg_cache[lib] = false return false end
+  local exists = handle:read("*a"):match("yes") ~= nil
   handle:close()
-  local exists = result:match("yes") ~= nil
-  if not exists then
-    pkg_cache[lib_name] = false
-  end
+  if not exists then pkg_cache[lib] = false end
   return exists
 end
 
--- Helper: scan source files for #include directives (optimized)
 local function scan_includes(files)
-  local includes = {}
-  local file_set = {}
-
-  -- Parse file list
-  local file_list = {}
+  local includes, seen = {}, {}
   for file in files:gmatch("[^%s]+") do
-    local clean_file = file:gsub('"', '')
-    if not file_set[clean_file] then
-      file_set[clean_file] = true
-      table.insert(file_list, clean_file)
-    end
-  end
-
-  -- Scan each file for includes
-  for _, file in ipairs(file_list) do
-    local f = io.open(file, "r")
-    if f then
-      for line in f:lines() do
-        -- Match #include <library> or #include "library"
-        local include = line:match('#include%s*[<"]([^>"]+)[>"]')
-        if include then
-          includes[include] = true
+    file = file:gsub('"', '')
+    if not seen[file] then
+      seen[file] = true
+      local f = io.open(file, "r")
+      if f then
+        for line in f:lines() do
+          local inc = line:match('#include%s*[<"]([^>"]+)[>"]')
+          if inc then includes[inc] = true end
         end
+        f:close()
       end
-      f:close()
     end
   end
-
   return includes
 end
 
--- Helper: comprehensive include to library mapping
-local function map_include_to_library(include)
-  local mapping = {
-    -- SDL libraries (prefer SDL3 > SDL2)
-    ["SDL3/SDL.h"] = {"sdl3"},
-    ["SDL2/SDL.h"] = {"sdl2"},
-    ["SDL.h"] = {"sdl3", "sdl2"},
-
-    -- SDL3 Image library (multiple possible patterns)
-    ["SDL3_image/SDL_image.h"] = {"sdl3-image"},
-    ["SDL_image.h"] = {"sdl3-image", "sdl2-image"},
-
-    -- SDL2 Image library
-    ["SDL2/SDL_image.h"] = {"SDL2_image"},
-
-    -- SDL3 TTF library
-    ["SDL3_ttf/SDL_ttf.h"] = {"SDL3_ttf"},
-    ["SDL3/SDL_ttf.h"] = {"SDL3_ttf"},
-    ["SDL_ttf.h"] = {"SDL3_ttf", "SDL2_ttf"},
-
-    -- SDL2 TTF library
-    ["SDL2/SDL_ttf.h"] = {"SDL2_ttf"},
-
-    -- SDL3 Mixer library
-    ["SDL3_mixer/SDL_mixer.h"] = {"SDL3_mixer"},
-    ["SDL3/SDL_mixer.h"] = {"SDL3_mixer"},
-    ["SDL_mixer.h"] = {"SDL3_mixer", "SDL2_mixer"},
-
-    -- SDL2 Mixer library
-    ["SDL2/SDL_mixer.h"] = {"SDL2_mixer"},
-
-    -- SDL3 Net library
-    ["SDL3_net/SDL_net.h"] = {"SDL3_net"},
-    ["SDL3/SDL_net.h"] = {"SDL3_net"},
-    ["SDL_net.h"] = {"SDL3_net", "SDL2_net"},
-
-    -- SDL2 Net library
-    ["SDL2/SDL_net.h"] = {"SDL2_net"},
-
-    -- SDL OpenGL integration (requires OpenGL linking)
-    ["SDL3/SDL_opengl.h"] = {"sdl3"},
-    ["SDL2/SDL_opengl.h"] = {"sdl2"},
-
-    -- OpenGL/Graphics (prefer modern alternatives)
-    ["GLFW/glfw3.h"] = {"glfw3"},
-    ["GL/glew.h"] = {"glew"},
-    ["GL/gl.h"] = {"gl"},
-    ["GL/glu.h"] = {"glu"},
-    ["GL/glut.h"] = {"freeglut", "glut"},
-    ["GL/freeglut.h"] = {"freeglut"},
-    ["GLUT/glut.h"] = {"freeglut", "glut"},
-    ["vulkan/vulkan.h"] = {"vulkan"},
-    ["vulkan/vulkan.hpp"] = {"vulkan"},
-
-    -- GLFW alternatives
-    ["glad/glad.h"] = {"glad"},
-    ["glad/gl.h"] = {"glad"},
-
-    -- UI Libraries (prefer GTK4 > GTK3)
-    ["gtk/gtk.h"] = {"gtk4", "gtk+-3.0"},
-    ["gtk-4.0/gtk/gtk.h"] = {"gtk4"},
-    ["gtk-3.0/gtk/gtk.h"] = {"gtk+-3.0"},
-    ["qt5/QtCore/QCoreApplication"] = {"Qt5Core"},
-    ["qt6/QtCore/QCoreApplication"] = {"Qt6Core"},
-    ["QCoreApplication"] = {"Qt6Core", "Qt5Core"},
-
-    -- Audio
-    ["AL/al.h"] = {"openal"},
-    ["AL/alc.h"] = {"openal"},
-    ["portaudio.h"] = {"portaudio-2.0"},
-    ["pulse/pulseaudio.h"] = {"libpulse"},
-    ["sndfile.h"] = {"sndfile"},
-    ["SFML/Audio.hpp"] = {"sfml-audio"},
-    ["FMOD/fmod.h"] = {},
-
-    -- Math/Physics
-    ["Eigen/Dense"] = {"eigen3"},
-    ["eigen3/Eigen/Dense"] = {"eigen3"},
-    ["glm/glm.hpp"] = {"glm"},
-    ["bullet/btBulletDynamicsCommon.h"] = {"bullet"},
-    ["Box2D/Box2D.h"] = {"box2d"},
-
-    -- Networking
-    ["curl/curl.h"] = {"libcurl"},
-    ["zmq.h"] = {"libzmq"},
-    ["asio.hpp"] = {"asio"},
-    ["boost/asio.hpp"] = {"boost"},
-
-    -- Image/Video
-    ["ft2build.h"] = {"freetype2"},
-    ["freetype2/ft2build.h"] = {"freetype2"},
-    ["png.h"] = {"libpng"},
-    ["jpeglib.h"] = {"libjpeg"},
-    ["webp/decode.h"] = {"libwebp"},
-    ["zlib.h"] = {"zlib"},
-    ["opencv2/opencv.hpp"] = {"opencv4", "opencv"},
-    ["opencv4/opencv2/opencv.hpp"] = {"opencv4"},
-
-    -- Game engines/frameworks
-    ["SFML/Graphics.hpp"] = {"sfml-graphics", "sfml-window", "sfml-system"},
-    ["SFML/Window.hpp"] = {"sfml-window", "sfml-system"},
-    ["SFML/System.hpp"] = {"sfml-system"},
-    ["raylib.h"] = {"raylib"},
-
-    -- Data formats
-    ["json.hpp"] = {},
-    ["yaml-cpp/yaml.h"] = {"yaml-cpp"},
-    ["pugixml.hpp"] = {"pugixml"},
-    ["sqlite3.h"] = {"sqlite3"},
-    ["postgresql/libpq-fe.h"] = {"libpq"},
-    ["mysql/mysql.h"] = {"mysqlclient"},
-
-    -- Threading/Concurrency
-    ["tbb/tbb.h"] = {"tbb"},
-    ["omp.h"] = {},
+local function map_include_to_library(inc)
+  local map = {
+    ["SDL3/SDL.h"] = {"sdl3"}, ["SDL2/SDL.h"] = {"sdl2"}, ["SDL.h"] = {"sdl3", "sdl2"},
+    ["SDL3_image/SDL_image.h"] = {"sdl3-image"}, ["SDL_image.h"] = {"sdl3-image", "sdl2-image"},
+    ["SDL2/SDL_image.h"] = {"SDL2_image"}, ["SDL3_ttf/SDL_ttf.h"] = {"SDL3_ttf"},
+    ["SDL3/SDL_ttf.h"] = {"SDL3_ttf"}, ["SDL_ttf.h"] = {"SDL3_ttf", "SDL2_ttf"},
+    ["SDL2/SDL_ttf.h"] = {"SDL2_ttf"}, ["SDL3_mixer/SDL_mixer.h"] = {"SDL3_mixer"},
+    ["SDL3/SDL_mixer.h"] = {"SDL3_mixer"}, ["SDL_mixer.h"] = {"SDL3_mixer", "SDL2_mixer"},
+    ["SDL2/SDL_mixer.h"] = {"SDL2_mixer"}, ["SDL3_net/SDL_net.h"] = {"SDL3_net"},
+    ["SDL3/SDL_net.h"] = {"SDL3_net"}, ["SDL_net.h"] = {"SDL3_net", "SDL2_net"},
+    ["SDL2/SDL_net.h"] = {"SDL2_net"}, ["SDL3/SDL_opengl.h"] = {"sdl3"},
+    ["SDL2/SDL_opengl.h"] = {"sdl2"}, ["GLFW/glfw3.h"] = {"glfw3"}, ["GL/glew.h"] = {"glew"},
+    ["GL/gl.h"] = {"gl"}, ["GL/glu.h"] = {"glu"}, ["GL/glut.h"] = {"freeglut", "glut"},
+    ["GL/freeglut.h"] = {"freeglut"}, ["GLUT/glut.h"] = {"freeglut", "glut"},
+    ["vulkan/vulkan.h"] = {"vulkan"}, ["vulkan/vulkan.hpp"] = {"vulkan"},
+    ["glad/glad.h"] = {"glad"}, ["glad/gl.h"] = {"glad"}, ["gtk/gtk.h"] = {"gtk4", "gtk+-3.0"},
+    ["gtk-4.0/gtk/gtk.h"] = {"gtk4"}, ["gtk-3.0/gtk/gtk.h"] = {"gtk+-3.0"},
+    ["qt5/QtCore/QCoreApplication"] = {"Qt5Core"}, ["qt6/QtCore/QCoreApplication"] = {"Qt6Core"},
+    ["QCoreApplication"] = {"Qt6Core", "Qt5Core"}, ["AL/al.h"] = {"openal"}, ["AL/alc.h"] = {"openal"},
+    ["portaudio.h"] = {"portaudio-2.0"}, ["pulse/pulseaudio.h"] = {"libpulse"},
+    ["sndfile.h"] = {"sndfile"}, ["SFML/Audio.hpp"] = {"sfml-audio"}, ["FMOD/fmod.h"] = {},
+    ["Eigen/Dense"] = {"eigen3"}, ["eigen3/Eigen/Dense"] = {"eigen3"}, ["glm/glm.hpp"] = {"glm"},
+    ["bullet/btBulletDynamicsCommon.h"] = {"bullet"}, ["Box2D/Box2D.h"] = {"box2d"},
+    ["curl/curl.h"] = {"libcurl"}, ["zmq.h"] = {"libzmq"}, ["asio.hpp"] = {"asio"},
+    ["boost/asio.hpp"] = {"boost"}, ["ft2build.h"] = {"freetype2"},
+    ["freetype2/ft2build.h"] = {"freetype2"}, ["png.h"] = {"libpng"}, ["jpeglib.h"] = {"libjpeg"},
+    ["webp/decode.h"] = {"libwebp"}, ["zlib.h"] = {"zlib"}, ["opencv2/opencv.hpp"] = {"opencv4", "opencv"},
+    ["opencv4/opencv2/opencv.hpp"] = {"opencv4"}, ["SFML/Graphics.hpp"] = {"sfml-graphics", "sfml-window", "sfml-system"},
+    ["SFML/Window.hpp"] = {"sfml-window", "sfml-system"}, ["SFML/System.hpp"] = {"sfml-system"},
+    ["raylib.h"] = {"raylib"}, ["json.hpp"] = {}, ["yaml-cpp/yaml.h"] = {"yaml-cpp"},
+    ["pugixml.hpp"] = {"pugixml"}, ["sqlite3.h"] = {"sqlite3"}, ["postgresql/libpq-fe.h"] = {"libpq"},
+    ["mysql/mysql.h"] = {"mysqlclient"}, ["tbb/tbb.h"] = {"tbb"}, ["omp.h"] = {}
   }
-
-  return mapping[include] or {}
+  return map[inc] or {}
 end
 
--- Helper: determine priority between library versions
 local function get_library_priority()
-  return {
-    -- Graphics (prefer newer/better)
-    ["sdl3"] = 100,
-    ["sdl2"] = 50,
-    ["SDL3_image"] = 100,
-    ["SDL2_image"] = 50,
-    ["SDL3_ttf"] = 100,
-    ["SDL2_ttf"] = 50,
-    ["SDL3_mixer"] = 100,
-    ["SDL2_mixer"] = 50,
-    ["SDL3_net"] = 100,
-    ["SDL2_net"] = 50,
-
-    -- UI (prefer GTK4 > GTK3, Qt6 > Qt5)
-    ["gtk4"] = 100,
-    ["gtk+-3.0"] = 50,
-    ["Qt6Core"] = 100,
-    ["Qt5Core"] = 50,
-
-    -- OpenGL utilities (prefer freeglut > glut)
-    ["freeglut"] = 100,
-    ["glut"] = 50,
-
-    -- Computer Vision
-    ["opencv4"] = 100,
-    ["opencv"] = 50,
-  }
+  return {sdl3=100, sdl2=50, SDL3_image=100, SDL2_image=50, SDL3_ttf=100, SDL2_ttf=50,
+    SDL3_mixer=100, SDL2_mixer=50, SDL3_net=100, SDL2_net=50, gtk4=100, ["gtk+-3.0"]=50,
+    Qt6Core=100, Qt5Core=50, freeglut=100, glut=50, opencv4=100, opencv=50}
 end
 
--- Helper: autodetect libraries based on actual includes
 local function autodetect_libraries(files)
-  -- Scan source files for includes
   local includes = scan_includes(files)
-
-  -- Build list of required libraries based on includes
-  local required_libs = {}
-  local lib_set = {}
-
-  for include, _ in pairs(includes) do
-    local lib_candidates = map_include_to_library(include)
-    for _, lib in ipairs(lib_candidates) do
-      if lib ~= "" and not lib_set[lib] then
-        lib_set[lib] = true
-        table.insert(required_libs, lib)
-      end
+  local libs, seen = {}, {}
+  for inc, _ in pairs(includes) do
+    for _, lib in ipairs(map_include_to_library(inc)) do
+      if lib ~= "" and not seen[lib] then seen[lib] = true table.insert(libs, lib) end
     end
   end
+  if #libs == 0 then return "" end
 
-  -- If no libraries detected from includes, return empty
-  if #required_libs == 0 then
-    return ""
-  end
-
-  -- Get priority map
   local priorities = get_library_priority()
-
-  -- Group libraries by family to handle version conflicts
-  local lib_families = {}
-
-  for _, lib in ipairs(required_libs) do
-    -- Extract library family
-    local family
-
-    if lib:match("^sdl3%-image") or lib:match("^sdl2%-image") then
-      family = "sdl_image"
-    elseif lib:match("^sdl3%-ttf") or lib:match("^sdl2%-ttf") then
-      family = "sdl_ttf"
-    elseif lib:match("^sdl3%-mixer") or lib:match("^sdl2%-mixer") then
-      family = "sdl_mixer"
-    elseif lib:match("^sdl3") or lib:match("^sdl2") then
-      family = "sdl_core"
-    else
-      family = lib:match("^([%a_%-]+)")
-    end
-
-    -- Handle special cases
-    if lib:match("^SDL%d+_") then
-      local base = lib:match("^(SDL%d+_[%a]+)")
-      family = base or family
-    elseif lib:match("^Qt%d+") then
-      family = "Qt"
-    elseif lib:match("^gtk") then
-      family = "gtk"
-    elseif lib:match("^opencv") then
-      family = "opencv"
-    end
-
-    if not lib_families[family] then
-      lib_families[family] = {lib}
-    else
-      table.insert(lib_families[family], lib)
-    end
+  local families = {}
+  for _, lib in ipairs(libs) do
+    local fam = lib:match("^sdl3%-image") or lib:match("^sdl2%-image") and "sdl_image"
+      or lib:match("^sdl3%-ttf") or lib:match("^sdl2%-ttf") and "sdl_ttf"
+      or lib:match("^sdl3%-mixer") or lib:match("^sdl2%-mixer") and "sdl_mixer"
+      or lib:match("^sdl3") or lib:match("^sdl2") and "sdl_core"
+      or lib:match("^SDL%d+_") and lib:match("^(SDL%d+_[%a]+)")
+      or lib:match("^Qt%d+") and "Qt"
+      or lib:match("^gtk") and "gtk"
+      or lib:match("^opencv") and "opencv"
+      or lib:match("^([%a_%-]+)")
+    families[fam] = families[fam] or {}
+    table.insert(families[fam], lib)
   end
 
-  -- Keep only highest priority version of each library family
-  local filtered_libs = {}
-  for family, libs in pairs(lib_families) do
-    if #libs == 1 then
-      table.insert(filtered_libs, libs[1])
+  local filtered = {}
+  for _, flibs in pairs(families) do
+    if #flibs == 1 then
+      table.insert(filtered, flibs[1])
     else
-      -- Sort by priority (highest first)
-      table.sort(libs, function(a, b)
-        return (priorities[a] or 0) > (priorities[b] or 0)
-      end)
-      -- Try libraries in priority order until one exists
-      for _, lib in ipairs(libs) do
-        if check_pkg_config(lib) then
-          table.insert(filtered_libs, lib)
-          break
-        end
+      table.sort(flibs, function(a, b) return (priorities[a] or 0) > (priorities[b] or 0) end)
+      for _, lib in ipairs(flibs) do
+        if check_pkg_config(lib) then table.insert(filtered, lib) break end
       end
     end
   end
 
-  -- Check which libraries are actually available and get their flags
-  local detected = {}
-  local flags_list = {}
-
-  for _, lib in ipairs(filtered_libs) do
+  local detected, flags_list = {}, {}
+  for _, lib in ipairs(filtered) do
     if check_pkg_config(lib) then
       local flags = get_pkg_config_flags(lib)
-      if flags then
-        table.insert(detected, lib)
-        table.insert(flags_list, flags)
-      end
+      if flags then table.insert(detected, lib) table.insert(flags_list, flags) end
     end
   end
 
-  -- Add special compiler flags for certain includes
-  local special_flags = {}
-  if includes["omp.h"] then
-    table.insert(special_flags, "-fopenmp")
-    table.insert(detected, "OpenMP")
-  end
+  local special = {}
+  if includes["omp.h"] then table.insert(special, "-fopenmp") table.insert(detected, "OpenMP") end
+  if #detected > 0 then vim.notify("Auto-detected: " .. table.concat(detected, ", "), vim.log.levels.INFO) end
 
-  -- Notify user of detected libraries
-  if #detected > 0 then
-    vim.notify("Auto-detected: " .. table.concat(detected, ", "), vim.log.levels.INFO)
-  end
-
-  local all_flags = table.concat(flags_list, " ")
-  if #special_flags > 0 then
-    all_flags = all_flags .. " " .. table.concat(special_flags, " ")
-  end
-
-  return all_flags
+  local all = table.concat(flags_list, " ")
+  return #special > 0 and all .. " " .. table.concat(special, " ") or all
 end
 
--- Helper: get manual OpenGL flags for systems without pkg-config
 local function get_manual_opengl_flags(files)
-  -- Check if OpenGL is needed
   local includes = scan_includes(files)
-  local needs_opengl = false
-
-  for include, _ in pairs(includes) do
-    if include:match("^GL/") or include:match("OpenGL") or
-       include:match("^GLFW/") or include:match("glfw") or
-       include:match("SDL_opengl") then
-      needs_opengl = true
-      break
+  for inc, _ in pairs(includes) do
+    if inc:match("^GL/") or inc:match("OpenGL") or inc:match("^GLFW/") or inc:match("glfw") or inc:match("SDL_opengl") then
+      local sys = vim.loop.os_uname().sysname
+      if sys == "Linux" then return "-lGL -lGLU"
+      elseif sys == "Darwin" then return "-framework OpenGL -framework Cocoa -framework IOKit -framework CoreVideo"
+      elseif sys:match("Windows") or sys:match("MINGW") or sys:match("MSYS") then return "-lopengl32 -lglu32" end
+      return ""
     end
   end
-
-  if not needs_opengl then
-    return ""
-  end
-
-  local system = vim.loop.os_uname().sysname
-
-  if system == "Linux" then
-    return "-lGL -lGLU"
-  elseif system == "Darwin" then
-    return "-framework OpenGL -framework Cocoa -framework IOKit -framework CoreVideo"
-  elseif system:match("Windows") or system:match("MINGW") or system:match("MSYS") then
-    return "-lopengl32 -lglu32"
-  end
-
   return ""
 end
 
--- Helper: detect shader stage from file content and extension
-local function detect_shader_stage(filepath)
-  local ext = filepath:match("%.([^.]+)$")
-  if not ext then
-    return "vertex"
-  end
+local function detect_shader_stage(path)
+  local ext_map = {vert="vertex", vs="vertex", frag="fragment", fs="fragment", comp="compute",
+    cs="compute", geom="geometry", gs="geometry", tesc="tesscontrol", tese="tesseval",
+    hlsl="auto", fx="auto", metal="metal", spvasm="spirv-asm", glsl="auto"}
+  local ext = path:match("%.([^.]+)$")
+  local stage = ext and ext_map[ext]
+  if stage and stage ~= "auto" then return stage end
 
-  -- Extension-based detection (primary method)
-  local ext_mappings = {
-    -- GLSL extensions
-    vert = "vertex",
-    vs = "vertex",
-    frag = "fragment",
-    fs = "fragment",
-    comp = "compute",
-    cs = "compute",
-    geom = "geometry",
-    gs = "geometry",
-    tesc = "tesscontrol",
-    tese = "tesseval",
-
-    -- HLSL extensions
-    hlsl = "auto",
-    fx = "auto",
-
-    -- Metal extensions
-    metal = "metal",
-
-    -- SPIR-V assembly
-    spvasm = "spirv-asm",
-
-    -- Catch-all GLSL
-    glsl = "auto"
-  }
-
-  local stage = ext_mappings[ext]
-
-  -- If we have a definitive stage from extension, return it
-  if stage and stage ~= "auto" then
-    return stage
-  end
-
-  -- If extension indicates auto-detection needed, inspect content
-  local f = io.open(filepath, "r")
+  local f = io.open(path, "r")
   if not f then
-    -- Can't open file, try filename pattern matching
-    local filename = filepath:match("([^/\\]+)$")
-    if filename then
-      filename = filename:lower()
-      if filename:match("vertex") or filename:match("vert") then
-        return "vertex"
-      elseif filename:match("fragment") or filename:match("frag") or filename:match("pixel") then
-        return "fragment"
-      elseif filename:match("compute") then
-        return "compute"
-      elseif filename:match("geometry") or filename:match("geom") then
-        return "geometry"
-      elseif filename:match("tess") then
-        if filename:match("control") or filename:match("tesc") then
-          return "tesscontrol"
-        elseif filename:match("eval") or filename:match("tese") then
-          return "tesseval"
-        end
+    local fn = path:match("([^/\\]+)$")
+    if fn then
+      fn = fn:lower()
+      if fn:match("vertex") or fn:match("vert") then return "vertex"
+      elseif fn:match("fragment") or fn:match("frag") or fn:match("pixel") then return "fragment"
+      elseif fn:match("compute") then return "compute"
+      elseif fn:match("geometry") or fn:match("geom") then return "geometry"
+      elseif fn:match("tess") then
+        return fn:match("control") or fn:match("tesc") and "tesscontrol" or "tesseval"
       end
     end
     return "vertex"
   end
 
-  local content = f:read("*a")
-  f:close()
+  local content = f:read("*a") f:close()
+  if not content or content == "" then return "vertex" end
 
-  if not content or content == "" then
-    return "vertex"
-  end
-
-  -- Check for shader stage indicators in content
   if content:match("main%s*%(%)%s*{") or content:match("void%s+main%s*%(") then
-    -- Look for stage-specific keywords (more comprehensive detection)
-
-    -- Vertex shader indicators
-    if content:match("gl_Position") or
-       content:match("gl_VertexID") or
-       content:match("gl_VertexIndex") or
-       content:match("gl_InstanceID") or
-       content:match("gl_InstanceIndex") then
-      return "vertex"
-
-    -- Fragment shader indicators
-    elseif content:match("gl_FragColor") or
-           content:match("gl_FragCoord") or
-           content:match("gl_FragDepth") or
-           content:match("gl_FrontFacing") or
-           content:match("gl_SampleID") or
-           content:match("gl_SamplePosition") then
-      return "fragment"
-
-    -- Compute shader indicators
-    elseif content:match("gl_GlobalInvocationID") or
-           content:match("gl_LocalInvocationID") or
-           content:match("gl_WorkGroupID") or
-           content:match("gl_NumWorkGroups") or
-           content:match("layout%s*%(local_size") then
-      return "compute"
-
-    -- Geometry shader indicators
-    elseif content:match("gl_PrimitiveIDIn") or
-           content:match("EmitVertex") or
-           content:match("EndPrimitive") or
-           content:match("gl_InvocationID.*geometry") then
-      return "geometry"
-
-    -- Tessellation control shader indicators
-    elseif content:match("gl_TessLevelOuter") or
-           content:match("gl_TessLevelInner") then
-      if content:match("gl_InvocationID") then
-        return "tesscontrol"
-      else
-        return "tesseval"
-      end
+    if content:match("gl_Position") or content:match("gl_VertexI") then return "vertex"
+    elseif content:match("gl_Frag") or content:match("gl_FrontFacing") or content:match("gl_SampleID") then return "fragment"
+    elseif content:match("gl_GlobalInvocationID") or content:match("gl_LocalInvocationID") or content:match("layout%s*%(local_size") then return "compute"
+    elseif content:match("gl_PrimitiveIDIn") or content:match("EmitVertex") or content:match("EndPrimitive") then return "geometry"
+    elseif content:match("gl_TessLevel") then
+      return content:match("gl_InvocationID") and "tesscontrol" or "tesseval"
     end
-
-    -- Fallback: check layout qualifiers to distinguish vertex vs fragment
-    -- Vertex shaders typically have "in" attributes, fragment shaders have "out" color
-    if content:match("layout%s*%([^%)]*location[^%)]*%)%s+in%s+vec") and
-       not content:match("layout%s*%([^%)]*location[^%)]*%)%s+out%s+vec4") then
+    if content:match("layout%s*%([^%)]*location[^%)]*%)%s+in%s+vec") and not content:match("layout%s*%([^%)]*location[^%)]*%)%s+out%s+vec4") then
       return "vertex"
-    elseif content:match("layout%s*%([^%)]*location[^%)]*%)%s+out%s+vec4") then
-      return "fragment"
-    end
+    elseif content:match("layout%s*%([^%)]*location[^%)]*%)%s+out%s+vec4") then return "fragment" end
   end
-
-  -- Check filename patterns as fallback
-  local filename = filepath:match("([^/\\]+)$")
-  if filename then
-    filename = filename:lower()
-    if filename:match("vertex") or filename:match("vert") then
-      return "vertex"
-    elseif filename:match("fragment") or filename:match("frag") or filename:match("pixel") then
-      return "fragment"
-    elseif filename:match("compute") then
-      return "compute"
-    elseif filename:match("geometry") or filename:match("geom") then
-      return "geometry"
-    elseif filename:match("tess") then
-      if filename:match("control") or filename:match("tesc") then
-        return "tesscontrol"
-      elseif filename:match("eval") or filename:match("tese") then
-        return "tesseval"
-      end
-    end
-  end
-
   return "vertex"
 end
 
--- Helper: find shader files in the project with comprehensive detection
 local function find_shader_files()
-  local cwd = vim.fn.getcwd()
-  local shaders = {}
+  local cwd, shaders = vim.fn.getcwd(), {}
+  local exts = {"vert", "vs", "vsh", "v.glsl", "vert.glsl", "frag", "fs", "fsh", "f.glsl",
+    "frag.glsl", "comp", "cs", "csh", "c.glsl", "comp.glsl", "geom", "gs", "gsh", "g.glsl",
+    "geom.glsl", "tesc", "tcs", "tesc.glsl", "tese", "tes", "tese.glsl", "glsl", "hlsl",
+    "fx", "fxh", "metal", "spvasm"}
 
-  -- Comprehensive list of shader file extensions
-  local shader_extensions = {
-    -- GLSL
-    "vert", "vs", "vsh", "v.glsl", "vert.glsl",
-    "frag", "fs", "fsh", "f.glsl", "frag.glsl",
-    "comp", "cs", "csh", "c.glsl", "comp.glsl",
-    "geom", "gs", "gsh", "g.glsl", "geom.glsl",
-    "tesc", "tcs", "tesc.glsl",
-    "tese", "tes", "tese.glsl",
-    "glsl",
-
-    -- HLSL
-    "hlsl", "fx", "fxh",
-
-    -- Metal
-    "metal",
-
-    -- SPIR-V assembly
-    "spvasm",
-  }
-
-  -- Search for shader files
-  for _, ext in ipairs(shader_extensions) do
-    local pattern = cwd .. "/**/*." .. ext
-    local found = vim.fn.glob(pattern, false, true)
-
+  for _, ext in ipairs(exts) do
+    local found = vim.fn.glob(cwd .. "/**/*." .. ext, false, true)
     if found and type(found) == "table" then
       for _, file in ipairs(found) do
-        -- Detect the shader stage
         local stage = detect_shader_stage(file)
-
-        if not shaders[stage] then
-          shaders[stage] = {}
-        end
-
+        shaders[stage] = shaders[stage] or {}
         table.insert(shaders[stage], file)
       end
     end
   end
-
-  -- Also search for common naming patterns without specific extensions
-  local patterns = {
-    "*shader*",
-    "*Shader*",
-    "*.spv",
-  }
-
-  for _, pattern in ipairs(patterns) do
-    local full_pattern = cwd .. "/**/" .. pattern
-    local found = vim.fn.glob(full_pattern, false, true)
-
-    if found and type(found) == "table" then
-      for _, file in ipairs(found) do
-        -- Skip if already processed or if it's a compiled output
-        local already_added = false
-        for _, stage_files in pairs(shaders) do
-          for _, existing_file in ipairs(stage_files) do
-            if existing_file == file then
-              already_added = true
-              break
-            end
-          end
-          if already_added then break end
-        end
-
-        if not already_added and not file:match("%.spv$") then
-          local stage = detect_shader_stage(file)
-          if not shaders[stage] then
-            shaders[stage] = {}
-          end
-          table.insert(shaders[stage], file)
-        end
-      end
-    end
-  end
-
   return shaders
 end
 
--- Helper: generate shader compilation commands
 local function generate_shader_commands()
-  local shaders = find_shader_files()
-  local commands = {}
-
-  -- Check for available shader compilers
-  local has_glslc = vim.fn.executable("glslc") == 1
-  local has_glslangValidator = vim.fn.executable("glslangValidator") == 1
-  local has_dxc = vim.fn.executable("dxc") == 1
-
-  if not (has_glslc or has_glslangValidator or has_dxc) then
+  local shaders, cmds = find_shader_files(), {}
+  local has = {glslc = vim.fn.executable("glslc") == 1, glslang = vim.fn.executable("glslangValidator") == 1,
+    dxc = vim.fn.executable("dxc") == 1}
+  if not (has.glslc or has.glslang or has.dxc) then
     vim.notify("No shader compiler found (glslc, glslangValidator, or dxc)", vim.log.levels.WARN)
     return {}
   end
 
   for stage, files in pairs(shaders) do
-    for _, shader_file in ipairs(files) do
-      local ext = shader_file:match("%.([^.]+)$")
-      local output_file = shader_file:gsub("%.%w+$", ".spv")
-      local cmd = nil
-
-      -- Determine appropriate compiler and flags
+    for _, shader in ipairs(files) do
+      local ext = shader:match("%.([^.]+)$")
+      local out = shader:gsub("%.%w+$", ".spv")
+      local cmd
       if ext == "hlsl" or ext == "fx" then
-        -- Use DirectX Shader Compiler for HLSL
-        if has_dxc then
-          local profile_map = {
-            vertex = "vs_6_0",
-            fragment = "ps_6_0",
-            compute = "cs_6_0",
-            geometry = "gs_6_0",
-            tesscontrol = "hs_6_0",
-            tesseval = "ds_6_0",
-          }
-          local profile = profile_map[stage] or "vs_6_0"
-          cmd = "dxc -T " .. profile .. " -E main -Fo \"" .. output_file .. "\" \"" .. shader_file .. "\""
+        if has.dxc then
+          local prof = ({vertex="vs_6_0", fragment="ps_6_0", compute="cs_6_0", geometry="gs_6_0",
+            tesscontrol="hs_6_0", tesseval="ds_6_0"})[stage] or "vs_6_0"
+          cmd = "dxc -T " .. prof .. " -E main -Fo \"" .. out .. "\" \"" .. shader .. "\""
         end
       elseif ext == "metal" then
-        -- Metal shaders typically compile with xcrun metal
-        output_file = shader_file:gsub("%.metal$", ".air")
-        cmd = "xcrun -sdk macosx metal -c \"" .. shader_file .. "\" -o \"" .. output_file .. "\""
+        out = shader:gsub("%.metal$", ".air")
+        cmd = "xcrun -sdk macosx metal -c \"" .. shader .. "\" -o \"" .. out .. "\""
       else
-        -- Use glslc or glslangValidator for GLSL with Vulkan 1.4 target
-        if has_glslc then
-          -- For .glsl files, auto-detect stage; for others, use detected stage
-          if ext == "glsl" then
-            cmd = "glslc --target-env=vulkan1.4 -fshader-stage=" .. stage ..
-                  " \"" .. shader_file .. "\" -o \"" .. output_file .. "\""
-          else
-            cmd = "glslc --target-env=vulkan1.4 -fshader-stage=" .. stage ..
-                  " \"" .. shader_file .. "\" -o \"" .. output_file .. "\""
-          end
-        elseif has_glslangValidator then
-          local stage_flag_map = {
-            vertex = "vert",
-            fragment = "frag",
-            compute = "comp",
-            geometry = "geom",
-            tesscontrol = "tesc",
-            tesseval = "tese",
-          }
-          local stage_flag = stage_flag_map[stage] or "vert"
-          cmd = "glslangValidator --target-env vulkan1.4 -V -S " .. stage_flag ..
-                " \"" .. shader_file .. "\" -o \"" .. output_file .. "\""
+        if has.glslc then
+          cmd = "glslc --target-env=vulkan1.4 -fshader-stage=" .. stage .. " \"" .. shader .. "\" -o \"" .. out .. "\""
+        elseif has.glslang then
+          local sf = ({vertex="vert", fragment="frag", compute="comp", geometry="geom",
+            tesscontrol="tesc", tesseval="tese"})[stage] or "vert"
+          cmd = "glslangValidator --target-env vulkan1.4 -V -S " .. sf .. " \"" .. shader .. "\" -o \"" .. out .. "\""
         end
       end
-
-      if cmd then
-        table.insert(commands, {
-          input = shader_file,
-          output = output_file,
-          stage = stage,
-          cmd = cmd
-        })
-      end
+      if cmd then table.insert(cmds, {input=shader, output=out, stage=stage, cmd=cmd}) end
     end
   end
-
-  return commands
+  return cmds
 end
 
--- Helper: generate compile_commands.json
-local function generate_compile_commands(entry_point, files, arguments)
-  local cwd = vim.fn.getcwd()
-  local commands = {}
-
-  -- Split files string into individual files
-  local file_list = {}
+local function generate_compile_commands(entry, files, args)
+  local cwd, cmds, list = vim.fn.getcwd(), {}, {}
   for file in files:gmatch("[^%s]+") do
-    local clean_file = file:gsub('"', '')
-    file_list[#file_list + 1] = clean_file
+    file = file:gsub('"', '')
+    local abs = file:match("^/") or file:match("^%a:") and file or cwd .. "/" .. file
+    table.insert(cmds, {directory=cwd, command="g++ " .. args .. " -c " .. file, file=abs})
   end
-
-  -- Create a compilation database entry for each file
-  for _, file in ipairs(file_list) do
-    local abs_file = file
-    if not file:match("^/") and not file:match("^%a:") then
-      abs_file = cwd .. "/" .. file
-    end
-
-    commands[#commands + 1] = {
-      directory = cwd,
-      command = "g++ " .. arguments .. " -c " .. file,
-      file = abs_file
-    }
-  end
-
-  -- Write to compile_commands.json
-  local json_content = vim.fn.json_encode(commands)
-  local output_file = cwd .. "/compile_commands.json"
-  vim.fn.writefile({json_content}, output_file)
-
-  return output_file
+  vim.fn.writefile({vim.fn.json_encode(cmds)}, cwd .. "/compile_commands.json")
+  return cwd .. "/compile_commands.json"
 end
 
---- Frontend - options displayed on telescope
 M.options = {
-  { text = "Build and run program", value = "option1" },
-  { text = "Build program", value = "option2" },
-  { text = "Run program", value = "option3" },
-  { text = "Compile shaders", value = "option6" },
-  { text = "Build solution", value = "option4" },
-  { text = "", value = "separator" },
-  { text = "Generate Compile Commands", value = "option5" }
+  {text="Build and run program", value="option1"}, {text="Build program", value="option2"},
+  {text="Run program", value="option3"}, {text="Compile shaders", value="option6"},
+  {text="Build solution", value="option4"}, {text="", value="separator"},
+  {text="Generate Compile Commands", value="option5"}
 }
 
---- Backend - overseer tasks performed on option selected
-function M.action(selected_option)
+function M.action(opt)
   local utils = require("compiler.utils")
   local overseer = require("overseer")
-  local entry_point = utils.os_path(vim.fn.getcwd() .. "/main.cpp")
-  local files = utils.find_files_to_compile(entry_point, "*.cpp", true)
-  local output_dir = utils.os_path(vim.fn.getcwd() .. "/bin/")
-  local output = utils.os_path(vim.fn.getcwd() .. "/bin/program")
+  local entry = utils.os_path(vim.fn.getcwd() .. "/main.cpp")
+  local files = utils.find_files_to_compile(entry, "*.cpp", true)
+  local out_dir = utils.os_path(vim.fn.getcwd() .. "/bin/")
+  local out = utils.os_path(vim.fn.getcwd() .. "/bin/program")
+  local detected = autodetect_libraries(files)
+  local manual = get_manual_opengl_flags(files)
+  if manual ~= "" then detected = detected ~= "" and detected .. " " .. manual or manual end
+  local args = "-Wall -Wextra -g -std=c++17 " .. detected
+  local msg = "--task finished--"
 
-  -- Autodetect libraries based on actual includes in source files
-  local detected_flags = autodetect_libraries(files)
-
-  -- Always check for OpenGL needs and add manual flags if detected
-  local manual_gl = get_manual_opengl_flags(files)
-  if manual_gl ~= "" then
-    if detected_flags ~= "" then
-      detected_flags = detected_flags .. " " .. manual_gl
-    else
-      detected_flags = manual_gl
-    end
-  end
-
-  local arguments = "-Wall -Wextra -g -std=c++17 " .. detected_flags
-  local final_message = "--task finished--"
-
-
-  if selected_option == "option1" then
-    local task = overseer.new_task({
-      name = "- C++ compiler",
-      strategy = { "orchestrator",
-        tasks = {{ name = "- Build & run program → \"" .. entry_point .. "\"",
-          cmd = "rm -f \"" .. output .. "\" || true" ..
-              " && mkdir -p \"" .. output_dir .. "\"" ..
-              " && g++ " .. files .. " -o \"" .. output .. "\" " .. arguments ..
-              " && \"" .. output .. "\"" ..
-              " && echo \"\n" .. entry_point .. "\"" ..
-              " && echo \"" .. final_message .. "\"",
-          components = { "default_extended" },
-          on_complete = function(task, code)
-            if code == 0 then
-              vim.notify("Build & run successful", vim.log.levels.INFO)
-            else
-              vim.notify("Build & run failed", vim.log.levels.ERROR)
-            end
-          end
-        },},},})
-    task:start()
-  elseif selected_option == "option2" then
-    local task = overseer.new_task({
-      name = "- C++ compiler",
-      strategy = { "orchestrator",
-        tasks = {{ name = "- Build program → \"" .. entry_point .. "\"",
-          cmd = "rm -f \"" .. output .. "\" || true" ..
-              " && mkdir -p \"" .. output_dir .. "\"" ..
-              " && g++ " .. files .. " -o \"" .. output .. "\" " .. arguments ..
-              " && echo \"\n" .. entry_point .. "\"" ..
-              " && echo \"" .. final_message .. "\"",
-          components = { "default_extended" },
-          on_complete = function(task, code)
-            if code == 0 then
-              vim.notify("Build successful", vim.log.levels.INFO)
-            else
-              vim.notify("Build failed", vim.log.levels.ERROR)
-            end
-          end
-        },},},})
-    task:start()
-  elseif selected_option == "option3" then
-    local task = overseer.new_task({
-      name = "- C++ compiler",
-      strategy = { "orchestrator",
-        tasks = {{ name = "- Run program → \"" .. output .. "\"",
-          cmd = "\"" .. output .. "\"" ..
-              " && echo \"" .. output .. "\"" ..
-              " && echo \"" .. final_message .. "\"",
-          components = { "default_extended" }
-        },},},})
-    task:start()
-  elseif selected_option == "option4" then
-    local entry_points
-    local task = {}
-    local tasks = {}
-    local executables = {}
-
-    -- if .solution file exists in working dir
-    local solution_file = utils.get_solution_file()
-    if solution_file then
-      local config = utils.parse_solution_file(solution_file)
-
-      for entry, variables in pairs(config) do
-        if entry == "executables" then goto continue end
-        entry_point = utils.os_path(variables.entry_point)
-        files = utils.find_files_to_compile(entry_point, "*.cpp")
-        output = utils.os_path(variables.output)
-        output_dir = utils.os_path(output:match("^(.-[/\\])[^/\\]*$"))
-        arguments = variables.arguments or arguments
-        task = { name = "- Build program → \"" .. entry_point .. "\"",
-          cmd = "rm -f \"" .. output .. "\" || true" ..
-              " && mkdir -p \"" .. output_dir .. "\"" ..
-              " && g++ " .. files .. " -o \"" .. output .. "\" " .. arguments ..
-              " && echo \"\n" .. entry_point .. "\"" ..
-              " && echo \"" .. final_message .. "\"",
-          components = { "default_extended" }
-        }
-        table.insert(tasks, task)
-        ::continue::
-      end
-
-      local solution_executables = config["executables"]
-      if solution_executables then
-        for entry, executable in pairs(solution_executables) do
-          executable = utils.os_path(executable, true)
-          task = { name = "- Run program → " .. executable,
-            cmd = executable ..
-                  " && echo \"" .. executable .. "\"" ..
-                  " && echo \"" .. final_message .. "\"",
-            components = { "default_extended" }
-          }
-          table.insert(executables, task)
+  if opt == "option1" then
+    overseer.new_task({name="- C++ compiler", strategy={"orchestrator", tasks={{
+      name="- Build & run program → \"" .. entry .. "\"",
+      cmd="rm -f \"" .. out .. "\" || true && mkdir -p \"" .. out_dir .. "\" && g++ " .. files .. " -o \"" .. out .. "\" " .. args .. " && \"" .. out .. "\" && echo \"\n" .. entry .. "\" && echo \"" .. msg .. "\"",
+      components={"default_extended"},
+      on_complete=function(t, c) vim.notify(c == 0 and "Build & run successful" or "Build & run failed", c == 0 and vim.log.levels.INFO or vim.log.levels.ERROR) end
+    }}}}):start()
+  elseif opt == "option2" then
+    overseer.new_task({name="- C++ compiler", strategy={"orchestrator", tasks={{
+      name="- Build program → \"" .. entry .. "\"",
+      cmd="rm -f \"" .. out .. "\" || true && mkdir -p \"" .. out_dir .. "\" && g++ " .. files .. " -o \"" .. out .. "\" " .. args .. " && echo \"\n" .. entry .. "\" && echo \"" .. msg .. "\"",
+      components={"default_extended"},
+      on_complete=function(t, c) vim.notify(c == 0 and "Build successful" or "Build failed", c == 0 and vim.log.levels.INFO or vim.log.levels.ERROR) end
+    }}}}):start()
+  elseif opt == "option3" then
+    overseer.new_task({name="- C++ compiler", strategy={"orchestrator", tasks={{
+      name="- Run program → \"" .. out .. "\"",
+      cmd="\"" .. out .. "\" && echo \"" .. out .. "\" && echo \"" .. msg .. "\"",
+      components={"default_extended"}
+    }}}}):start()
+  elseif opt == "option4" then
+    local sol = utils.get_solution_file()
+    local tasks, execs = {}, {}
+    if sol then
+      local cfg = utils.parse_solution_file(sol)
+      for e, v in pairs(cfg) do
+        if e ~= "executables" then
+          local ep = utils.os_path(v.entry_point)
+          local fs = utils.find_files_to_compile(ep, "*.cpp")
+          local o = utils.os_path(v.output)
+          local od = utils.os_path(o:match("^(.-[/\\])[^/\\]*$"))
+          local a = v.arguments or args
+          table.insert(tasks, {name="- Build program → \"" .. ep .. "\"",
+            cmd="rm -f \"" .. o .. "\" || true && mkdir -p \"" .. od .. "\" && g++ " .. fs .. " -o \"" .. o .. "\" " .. a .. " && echo \"\n" .. ep .. "\" && echo \"" .. msg .. "\"",
+            components={"default_extended"}})
         end
       end
-
-      task = overseer.new_task({
-        name = "- C++ compiler", strategy = { "orchestrator",
-          tasks = {
-            tasks,
-            executables
-          }}})
-      task:start()
-
-    else
-      entry_points = utils.find_files(vim.fn.getcwd(), "main.cpp")
-
-      for _, entry_point in ipairs(entry_points) do
-        entry_point = utils.os_path(entry_point)
-        files = utils.find_files_to_compile(entry_point, "*.cpp")
-        output_dir = utils.os_path(entry_point:match("^(.-[/\\])[^/\\]*$") .. "bin")
-        output = utils.os_path(output_dir .. "/program")
-        task = { name = "- Build program → \"" .. entry_point .. "\"",
-          cmd = "rm -f \"" .. output .. "\" || true" ..
-              " && mkdir -p \"" .. output_dir .. "\"" ..
-              " && g++ " .. files .. " -o \"" .. output .. "\" " .. arguments ..
-              " && echo \"" .. entry_point .. "\"" ..
-              " && echo \"" .. final_message .. "\"",
-          components = { "default_extended" }
-        }
-        table.insert(tasks, task)
+      if cfg.executables then
+        for _, ex in pairs(cfg.executables) do
+          ex = utils.os_path(ex, true)
+          table.insert(execs, {name="- Run program → " .. ex, cmd=ex .. " && echo \"" .. ex .. "\" && echo \"" .. msg .. "\"", components={"default_extended"}})
+        end
       end
-
-      task = overseer.new_task({
-        name = "- C++ compiler", strategy = { "orchestrator", tasks = tasks }
-      })
-      task:start()
+      overseer.new_task({name="- C++ compiler", strategy={"orchestrator", tasks={tasks, execs}}}):start()
+    else
+      for _, ep in ipairs(utils.find_files(vim.fn.getcwd(), "main.cpp")) do
+        ep = utils.os_path(ep)
+        local fs = utils.find_files_to_compile(ep, "*.cpp")
+        local od = utils.os_path(ep:match("^(.-[/\\])[^/\\]*$") .. "bin")
+        local o = utils.os_path(od .. "/program")
+        table.insert(tasks, {name="- Build program → \"" .. ep .. "\"",
+          cmd="rm -f \"" .. o .. "\" || true && mkdir -p \"" .. od .. "\" && g++ " .. fs .. " -o \"" .. o .. "\" " .. args .. " && echo \"" .. ep .. "\" && echo \"" .. msg .. "\"",
+          components={"default_extended"}})
+      end
+      overseer.new_task({name="- C++ compiler", strategy={"orchestrator", tasks=tasks}}):start()
     end
-  elseif selected_option == "option5" then
-    local output_file = generate_compile_commands(entry_point, files, arguments)
-
-    local task = overseer.new_task({
-      name = "- Generate compile_commands.json",
-      strategy = { "orchestrator",
-        tasks = {{ name = "- Generate compile_commands.json → \"" .. output_file .. "\"",
-          cmd = "echo 'Generated: " .. output_file .. "'" ..
-                " && echo \"" .. final_message .. "\"",
-          components = { "default_extended" }
-        },},},})
-    task:start()
-  elseif selected_option == "option6" then
-    local shader_commands = generate_shader_commands()
-
-    if #shader_commands == 0 then
-      vim.notify("No shader files found in project", vim.log.levels.WARN)
-      return
-    end
-
-    local tasks = {}
-    local valid_count = 0
-    local shader_files = {}
-
-    for _, shader_info in ipairs(shader_commands) do
-      local stat = vim.loop.fs_stat(shader_info.input)
+  elseif opt == "option5" then
+    local outf = generate_compile_commands(entry, files, args)
+    overseer.new_task({name="- Generate compile_commands.json", strategy={"orchestrator", tasks={{
+      name="- Generate compile_commands.json → \"" .. outf .. "\"",
+      cmd="echo 'Generated: " .. outf .. "' && echo \"" .. msg .. "\"",
+      components={"default_extended"}
+    }}}}):start()
+  elseif opt == "option6" then
+    local scmds = generate_shader_commands()
+    if #scmds == 0 then vim.notify("No shader files found in project", vim.log.levels.WARN) return end
+    local tasks, sfiles = {}, {}
+    for _, si in ipairs(scmds) do
+      local stat = vim.loop.fs_stat(si.input)
       if stat and stat.type ~= "directory" then
-        local task = {
-          name = "- Compile shader → \"" .. shader_info.input .. "\"",
-          cmd = shader_info.cmd .. " 2>&1",
-          components = {
-            { "on_output_quickfix", open = false },
-            "default"
-          }
-        }
-        table.insert(tasks, task)
-        table.insert(shader_files, shader_info.input)
-        valid_count = valid_count + 1
+        table.insert(tasks, {name="- Compile shader → \"" .. si.input .. "\"", cmd=si.cmd .. " 2>&1",
+          components={{"on_output_quickfix", open=false}, "default"}})
+        table.insert(sfiles, si.input)
       end
     end
-
-    if #tasks == 0 then
-      vim.notify("No valid shader files to compile", vim.log.levels.WARN)
-      return
-    end
-
-    local task = overseer.new_task({
-      name = "- Shader compiler",
-      strategy = { "orchestrator", tasks = tasks },
-      on_complete = function(task, code)
-        if code == 0 then
-          vim.notify("Successfully compiled " .. valid_count .. " shader(s)", vim.log.levels.INFO)
+    if #tasks == 0 then vim.notify("No valid shader files to compile", vim.log.levels.WARN) return end
+    overseer.new_task({name="- Shader compiler", strategy={"orchestrator", tasks=tasks},
+      on_complete=function(t, c)
+        if c == 0 then vim.notify("Successfully compiled " .. #tasks .. " shader(s)", vim.log.levels.INFO)
         else
-          -- Parse which shaders failed
-          local failed_shaders = {}
-          for i, shader_file in ipairs(shader_files) do
-            local output_file = shader_file:gsub("%.%w+$", ".spv")
-            local stat = vim.loop.fs_stat(output_file)
-            if not stat then
-              table.insert(failed_shaders, shader_file)
-            end
+          local failed = {}
+          for _, sf in ipairs(sfiles) do
+            if not vim.loop.fs_stat(sf:gsub("%.%w+$", ".spv")) then table.insert(failed, sf) end
           end
-
-          if #failed_shaders > 0 then
-            vim.notify("Shader compilation failed for: " .. table.concat(failed_shaders, ", "), vim.log.levels.ERROR)
-          else
-            vim.notify("Shader compilation failed", vim.log.levels.ERROR)
-          end
+          vim.notify(#failed > 0 and "Shader compilation failed for: " .. table.concat(failed, ", ") or "Shader compilation failed", vim.log.levels.ERROR)
         end
-      end
-    })
-    task:start()
+      end}):start()
   end
 end
 
