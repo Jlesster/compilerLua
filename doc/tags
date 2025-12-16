@@ -1,0 +1,3 @@
+compiler	compiler.txt	/*compiler*
+compiler.txt	compiler.txt	/*compiler.txt*
+markmap-table-of-contents	compiler.txt	/*markmap-table-of-contents*
