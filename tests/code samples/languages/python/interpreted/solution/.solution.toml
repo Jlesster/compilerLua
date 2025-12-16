@@ -1,0 +1,5 @@
+[HelloWorld]
+entry_point = "./main.py"
+
+[MyOtherCoolScript]
+entry_point = "./extra.py"
