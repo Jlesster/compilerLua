@@ -172,6 +172,7 @@ local function add_lwjgl_library()
       " <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-lz4</artifactId></dependency>",
       " <dependency><groupId>io.github.spair</groupId><artifactId>imgui-java-binding</artifactId><version>1.86.11</version></dependency>",
       " <dependency><groupId>io.github.spair</groupId><artifactId>imgui-java-lwjgl3</artifactId><version>1.86.11</version></dependency>",
+      " <dependency><groupId>io.github.spair</groupId><artifactId>imgui-java-natives-linux</artifactId><version>1.86.11</version></dependency>",
       " <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-meow</artifactId></dependency>",
       " <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-meshoptimizer</artifactId></dependency>",
       " <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-msdfgen</artifactId></dependency>",
